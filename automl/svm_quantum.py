@@ -9,25 +9,13 @@ from sklearn import svm
 from sklearn.metrics import roc_auc_score
 import pandas as pd
 from sklearn.model_selection import train_test_split, KFold
-
-from qiskit import QuantumCircuit
-from qiskit.algorithms import IterativeAmplitudeEstimation, EstimationProblem
-from qiskit.circuit.library import LinearAmplitudeFunction
-from qiskit_aer.primitives import Sampler
-from qiskit_finance.circuit.library import NormalDistribution
-
-from qiskit_aer.noise import NoiseModel
-from qiskit.providers.fake_provider import FakeSingapore, FakeLagos, FakeWashington
-
-device = FakeWashington()
-coupling_map = device.configuration().coupling_map
-noise_model = NoiseModel.from_backend(device)
+import cirq
+from helper_funcs_quantum import create_normal_distribution_circuit, create_linear_amplitude_function, amplitude_estimation_cirq
 
 quantum_noise = False
 linear_bandit = False
 
 max_iter = int(5000)
-
 
 ls = np.array([0.2, 0.2]) # this seems to be the best
 v_kernel = 0.5
@@ -68,8 +56,8 @@ def svm_reward_function(param, eps):
     low = mean - 3 * stddev
     high = mean + 3 * stddev
 
-    # creating an uncertainty model
-    uncertainty_model = NormalDistribution(num_uncertainty_qubits, mu=mean, sigma=stddev**2, bounds=(low, high))        
+    # Create uncertainty model using Cirq
+    uncertainty_model = create_normal_distribution_circuit(num_uncertainty_qubits, mean, stddev**2, (low, high))
     
     c_approx = 1
     slopes = 1
@@ -77,57 +65,39 @@ def svm_reward_function(param, eps):
     f_min = low
     f_max = high
 
-    # The LinearAmplitudeFunction is a piecewise linear function
-    linear_payoff = LinearAmplitudeFunction(
+    # Create linear amplitude function using Cirq
+    linear_payoff = create_linear_amplitude_function(
         num_uncertainty_qubits,
         slopes,
         offsets,
-        domain=(low, high),
-        image=(f_min, f_max),
-        rescaling_factor=c_approx,
+        (low, high),
+        (f_min, f_max),
+        c_approx,
     )
 
-    # construct A operator for QAE for the payoff function by
-    # composing the uncertainty model and the objective
-    num_qubits = linear_payoff.num_qubits
-    monte_carlo = QuantumCircuit(num_qubits)
-    monte_carlo.append(uncertainty_model, range(num_uncertainty_qubits))
-    monte_carlo.append(linear_payoff, range(num_qubits))
+    # Combine uncertainty model and linear payoff
+    monte_carlo = uncertainty_model + linear_payoff
 
     epsilon = eps / (3 * stddev)
-
-    objective_qubits = [0]
-    seed = 0
-
     epsilon = np.clip(epsilon, 1e-6, 0.5)
 
     alpha = 0.05
-    max_shots = 32 * np.log(2/alpha*np.log2(np.pi/(4*epsilon))) 
+    max_shots = int(32 * np.log(2/alpha*np.log2(np.pi/(4*epsilon))))
 
-    # construct estimation problem. post_processing is the inverse of the rescaling, i.e., it maps the [0, 1] interval to the original one.
-    # objective_qubits is the list of qubits that are used to encode the objective function.
-    # problem is the estimation problem that is passed to the QAE algorithm.
-    problem = EstimationProblem(state_preparation=monte_carlo, objective_qubits=objective_qubits, post_processing=linear_payoff.post_processing, )
-    # construct amplitude estimation
+    # Define objective qubits (first qubit in this case)
+    objective_qubits = [0]
 
-    if quantum_noise == True:
-        ae = IterativeAmplitudeEstimation(
-            epsilon_target=epsilon, alpha=alpha, sampler=Sampler(backend_options={
-                "method": "density_matrix",
-                "coupling_map": coupling_map,
-                "noise_model": noise_model,
-            },run_options={"shots": int(np.ceil(max_shots)),"seed_simulator":seed},
-            transpile_options={"seed_transpiler": seed},)
-        )
-    else:
-        ae = IterativeAmplitudeEstimation(epsilon_target=epsilon, alpha=alpha, sampler=Sampler(run_options={"shots": int(np.ceil(max_shots)),"seed_simulator":seed}))
-
-
-    # Running result
-    result = ae.estimate(problem)
-    est = result.estimation_processed
+    # Perform amplitude estimation using Cirq
+    estimated_amplitude, confidence_interval, num_oracle_queries = amplitude_estimation_cirq(
+        monte_carlo, 
+        objective_qubits, 
+        epsilon, 
+        alpha, 
+        shots=max_shots
+    )
     
-    num_oracle_queries = result.num_oracle_queries
+    # Post-processing: map the amplitude back to the original domain
+    est = estimated_amplitude * (high - low) + low
 
     if num_oracle_queries == 0:
         # use the number of oracle calls given by the paper if num_oracle_queries == 0

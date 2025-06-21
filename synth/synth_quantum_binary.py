@@ -4,24 +4,9 @@ sys.path.append('../')
 from bayesian_optimization_quantum import QBO
 import pickle
 import numpy as np
-
 from multiprocessing.dummy import Pool as ThreadPool
-
-from qiskit import QuantumCircuit
-from qiskit.algorithms import IterativeAmplitudeEstimation, EstimationProblem
-from qiskit.circuit.library import LinearAmplitudeFunction
-from qiskit_aer.primitives import Sampler
-from qiskit_finance.circuit.library import NormalDistribution
-
-from qiskit.circuit.library import RYGate
-
-from qiskit_aer.noise import NoiseModel
-from qiskit.providers.fake_provider import FakeWashington
-
-device = FakeWashington()
-coupling_map = device.configuration().coupling_map
-noise_model = NoiseModel.from_backend(device)
-
+import cirq
+from helper_funcs_quantum import amplitude_estimation_cirq
 
 quantum_noise = False
 binary = True # always set this to True
@@ -52,51 +37,36 @@ def synth_func(param, eps):
     
     # Calculate the rotation angle
     theta = 2 * np.arcsin(np.sqrt(p))
-    # Create a quantum circuit
-    qc = QuantumCircuit(num_uncertainty_qubits)
-
+    
+    # Create a quantum circuit using Cirq
+    qubit = cirq.LineQubit(0)
+    qc = cirq.Circuit()
+    
     # Apply the RY rotation
-    qc.append(RYGate(theta), [0])
+    qc.append(cirq.ry(theta).on(qubit))
     uncertainty_model = qc
 
     monte_carlo = uncertainty_model
 
     epsilon = eps
-
-    objective_qubits = [0]
-    seed = 0
-
     epsilon = np.clip(epsilon, 1e-6, 0.5)
 
     alpha = 0.05
-    max_shots = 32 * np.log(2/alpha*np.log2(np.pi/(4*epsilon))) 
+    max_shots = int(32 * np.log(2/alpha*np.log2(np.pi/(4*epsilon))))
     
-    post_processing = lambda x: x
+    # Define objective qubits (first qubit in this case)
+    objective_qubits = [0]
 
-    problem = EstimationProblem(
-        state_preparation=monte_carlo,
-        objective_qubits=objective_qubits,
-        post_processing=post_processing,)
+    # Perform amplitude estimation using Cirq
+    estimated_amplitude, confidence_interval, num_oracle_queries = amplitude_estimation_cirq(
+        monte_carlo, 
+        objective_qubits, 
+        epsilon, 
+        alpha, 
+        shots=max_shots
+    )
 
-    if quantum_noise == True:
-        ae = IterativeAmplitudeEstimation(
-            epsilon_target=epsilon, alpha=alpha, sampler=Sampler(backend_options={
-                "method": "density_matrix",
-                "coupling_map": coupling_map,
-                "noise_model": noise_model,
-            },run_options={"shots": int(np.ceil(max_shots)),"seed_simulator":seed},
-            transpile_options={"seed_transpiler": seed},)
-        )
-    else:
-        ae = IterativeAmplitudeEstimation(
-            epsilon_target=epsilon, alpha=alpha, sampler=Sampler(run_options={"shots": int(np.ceil(max_shots)),"seed_simulator":seed}))
-
-    # Running result
-    result = ae.estimate(problem)
-
-    est = result.estimation_processed
-
-    num_oracle_queries = result.num_oracle_queries
+    est = estimated_amplitude
 
     if num_oracle_queries == 0:
         # use the number of oracle calls given by the paper if num_oracle_queries == 0
